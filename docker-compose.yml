@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tms-oc-postgres
+    env_file:
+      - .env.docker
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: tms-oc-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  adminer:
+    image: adminer:4.8.1
+    container_name: tms-oc-adminer
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+
+  redis:
+    image: redis:7-alpine
+    container_name: tms-oc-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: tms-oc-rabbitmq
+    ports:
+      - "5672:5672"   # AMQP (Celery broker)
+      - "15672:15672"  # Management UI (guest/guest)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tms-oc-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.docker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tms-oc-celery-worker
+    env_file:
+      - .env.docker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+    command: celery -A src.celery_app worker --loglevel=info --concurrency=2 -Q default,classification,reminders
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tms-oc-celery-beat
+    env_file:
+      - .env.docker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+    command: celery -A src.celery_app beat --loglevel=info --scheduler celery.beat.PersistentScheduler
+
+volumes:
+  postgres_data:
+  ollama_data:
+  redis_data:
+  rabbitmq_data:

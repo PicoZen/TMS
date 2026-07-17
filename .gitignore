@@ -1,0 +1,34 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- Virtual environments ---
+# This repo has a local venv checked out at ./pyenv — never commit it.
+# Each dev creates their own from requirements/*.txt.
+pyenv/
+.venv/
+venv/
+
+# --- Environment / secrets ---
+# .env.example IS committed (it's the template) - only the real .env is ignored.
+.env
+# Same split for the Docker Compose env file: .env.docker.example is
+# committed, .env.docker (with live secrets) is not.
+.env.docker
+
+# --- Local runtime state (regenerated automatically, never source) ---
+test.db
+*.db
+celerybeat-schedule*
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+
+# Alembic's own __pycache__ is covered by the top-level __pycache__/ rule above.
+# alembic/versions/*.py is intentionally NOT ignored - migration history is source.
+
+*.md
