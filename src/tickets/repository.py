@@ -46,17 +46,36 @@ class TicketRepository:
             query = query.where(Ticket.category == params.category)
         if params.assignee_id:
             query = query.where(Ticket.assignee_id == params.assignee_id)
+
+        # Full-text search on Postgres (generated tsvector column + GIN
+        # index, see migration a3f7c9e21d40). SQLite has no FTS engine
+        # wired up here, so the test suite (see tests/conftest.py) falls
+        # back to a plain ILIKE match - correct results, just an
+        # unindexed scan, which is fine at test-database scale. See
+        # DECISIONS.md "Ticket search & filtering" for the tradeoffs.
+        rank_expr = None
         if params.keyword:
-            query = query.where(
-                Ticket.title.ilike(f"%{params.keyword}%")
-                | Ticket.description.ilike(f"%{params.keyword}%")
-            )
+            dialect_name = self.session.bind.dialect.name if self.session.bind else "postgresql"
+            if dialect_name == "postgresql":
+                tsquery = func.websearch_to_tsquery("english", params.keyword)
+                query = query.where(Ticket.search_vector.op("@@")(tsquery))
+                rank_expr = func.ts_rank(Ticket.search_vector, tsquery)
+            else:
+                like = f"%{params.keyword}%"
+                query = query.where(
+                    Ticket.title.ilike(like) | Ticket.description.ilike(like)
+                )
+
         if params.created_after:
             query = query.where(Ticket.created_at >= params.created_after)
         if params.created_before:
             query = query.where(Ticket.created_at <= params.created_before)
 
-        query = query.order_by(Ticket.created_at.desc())
+        if rank_expr is not None:
+            # Most-relevant match first, most-recent as tiebreaker.
+            query = query.order_by(rank_expr.desc(), Ticket.created_at.desc())
+        else:
+            query = query.order_by(Ticket.created_at.desc())
 
         pagination_params = type(
             "PaginationParams", (), {"page": params.page, "page_size": params.page_size}

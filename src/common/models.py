@@ -5,6 +5,7 @@ from typing import Optional
 from sqlalchemy import (
     DateTime,
     Enum,
+    FetchedValue,
     ForeignKey,
     Integer,
     String,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.common.database import Base
@@ -99,6 +101,28 @@ class Ticket(Base):
         Enum(ClassificationStatus), nullable=False, default=ClassificationStatus.PENDING, index=True
     )
     classification_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # A real Postgres generated tsvector column (GENERATED ALWAYS AS ...
+    # STORED), auto-maintained by Postgres on every insert/update of
+    # title/description - added via raw DDL in the migration, not here,
+    # since SQLAlchemy's Computed() expression can't express to_tsvector()
+    # cleanly across dialect variants. See DECISIONS.md "Ticket search &
+    # filtering" and migration a3f7c9e21d40.
+    # .with_variant(Text(), "sqlite"): the test suite runs against SQLite
+    # (see tests/conftest.py), which has no tsvector type at all - without
+    # this, Base.metadata.create_all() would fail outright on SQLite. On
+    # SQLite this becomes an ordinary, never-populated TEXT column;
+    # TicketRepository.search() only ever queries it on the Postgres path,
+    # falling back to a plain ILIKE match on SQLite (see DECISIONS.md).
+    search_vector: Mapped[Optional[str]] = mapped_column(
+        TSVECTOR().with_variant(Text(), "sqlite"),
+        nullable=True,
+        # Postgres populates this itself (GENERATED ALWAYS AS ... STORED,
+        # see migration a3f7c9e21d40) - server_default=FetchedValue() tells
+        # SQLAlchemy this column is server-owned so it's left out of
+        # INSERT/UPDATE entirely, instead of sending an explicit NULL that
+        # Postgres rejects with GeneratedAlwaysError.
+        server_default=FetchedValue(),
+    )
     assignee_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )

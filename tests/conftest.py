@@ -1,4 +1,3 @@
-import asyncio
 import os
 from typing import AsyncGenerator
 
@@ -6,9 +5,16 @@ import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 # Set test environment BEFORE importing anything
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+# SQLite, in-process - no external database service required to run the
+# suite. Ticket.search_vector is declared with .with_variant(Text(),
+# "sqlite") (see src/common/models.py) so schema creation succeeds here,
+# and TicketRepository.search() falls back to a plain ILIKE match on any
+# non-Postgres dialect instead of the real tsvector/websearch_to_tsquery
+# path - see DECISIONS.md "Ticket search & filtering".
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
 os.environ.setdefault("LLM_PROVIDER", "mock")  # Use mock LLM for tests
 os.environ.setdefault("TESTING", "true")  # Mark as test environment
@@ -30,9 +36,17 @@ from src.common.models import Base, User
 from src.common.security import hash_password
 from src.main import app
 
-TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+TEST_DATABASE_URL = os.environ["DATABASE_URL"]
+# ^ Honors an explicitly-exported DATABASE_URL if you want to point the
+# suite at something else instead of the default SQLite file above.
 
-test_engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+# NullPool: every checkout opens a fresh connection and every checkin closes
+# it, rather than a connection being reused across test functions. This
+# matters because pytest-asyncio 1.x scopes its event loop per
+# `asyncio_default_fixture_loop_scope` in pytest.ini (currently "session"),
+# and a pooled connection tied to a closed event loop can't be reused - see
+# pytest.ini for the full story. Cheap to keep even for SQLite.
+test_engine = create_async_engine(TEST_DATABASE_URL, echo=False, poolclass=NullPool)
 TestSessionLocal = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -46,13 +60,6 @@ async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
             raise
         finally:
             await session.close()
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest_asyncio.fixture(scope="function", autouse=True)

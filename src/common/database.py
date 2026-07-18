@@ -15,14 +15,8 @@ class Base(DeclarativeBase):
     pass
 
 
-# Determine if we're using SQLite (for tests)
 def _get_engine_args(database_url: str) -> dict:
-    """Get engine arguments based on database dialect."""
-    if database_url.startswith("sqlite"):
-        return {
-            "echo": settings.debug,
-            "pool_pre_ping": True,
-        }
+    """Get engine arguments for the async Postgres engine."""
     return {
         "echo": settings.debug,
         "pool_pre_ping": True,
@@ -71,8 +65,24 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    """Verify the database is reachable at startup.
+
+    This deliberately does NOT call Base.metadata.create_all(). Schema is
+    owned entirely by Alembic migrations (see alembic/versions/) - running
+    create_all() here as well means two different code paths can create or
+    check the same tables, which is both redundant (it re-ran a has_table()
+    reflection query for every table on every single app startup/reload)
+    and a real source of the
+    'InterfaceError: cannot perform operation: another operation is in
+    progress' errors seen under uvicorn --reload: a restart mid-reflection
+    could leave a pooled connection in a half-finished state that then gets
+    handed back out to a real request.
+    Run `alembic upgrade head` before starting the app instead - see SETUP.md.
+    """
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
 
 
 async def close_db() -> None:

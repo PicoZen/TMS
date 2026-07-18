@@ -119,7 +119,12 @@ as soon as the ticket is saved — the LLM call happens entirely after the
 response, in a worker process. This was the one hard constraint in the
 brief ("must not block ticket creation") and it's structural, not just a
 try/except: there is no code path in the request handler that calls an LLM
-adapter at all.
+adapter at all. As of this pass, the enqueue call itself is also wrapped in
+a try/except (`src/tickets/service.py::create_ticket`) — a broker outage
+(Redis down, network blip) logs `classification_enqueue_failed` and the
+ticket is still returned successfully rather than surfacing as a 500; it
+simply stays at `classification_status=PENDING` until retried or handled
+manually.
 
 Retry lives at exactly one layer: `classify_ticket_task` (in
 `src/tasks/classification_tasks.py`) catches any exception from
@@ -200,32 +205,60 @@ lock per reminder/ticket ID) is the next step before that scale-out.
 
 ## Ticket search & filtering
 
-**Decision (current): `ILIKE '%term%'` over `title`/`description`, combined
-with equality filters (`status`, `priority`, `category`, `assignee_id`) and a
-date range, offset/limit paginated.**
+**Decision: Postgres full-text search (`tsvector` generated column + GIN
+index, queried via `websearch_to_tsquery`), combined with equality filters
+(`status`, `priority`, `category`, `assignee_id`) and a date range,
+offset/limit paginated.** This was option 1 of the upgrade path documented
+below, now implemented (`alembic/versions/a3f7c9e21d40_...py`,
+`src/tickets/repository.py::search`).
 
-This was the pragmatic choice for the assignment's scope — it needs no new
-infrastructure, works identically on the SQLite test database and the
-Postgres production database, and is genuinely correct (returns the right
-results), just not the fastest approach at scale.
+**Why FTS over the ILIKE-only approach this project started with**: `ILIKE
+'%term%'` (leading wildcard) can't use a standard B-tree index, so it's a
+sequential scan over `tickets` once the table is large — fine at demo/small
+support-team volume, not fine in the tens/hundreds of thousands of rows.
+Postgres FTS needed no new service, stays inside the same transaction as
+everything else, and adds relevance ranking (`ts_rank`) and stemming
+("logging" also matching "login") that `ILIKE` structurally can't do.
+`Ticket.search_vector` is a *generated* column
+(`GENERATED ALWAYS AS (to_tsvector(...)) STORED`) — Postgres maintains it
+automatically on every insert/update of `title`/`description`; the app never
+writes to it (`server_default=FetchedValue()` on the model tells SQLAlchemy
+to leave the column out of INSERT/UPDATE entirely).
 
-**Known cost**: `ILIKE '%term%'` (leading wildcard) can't use a standard
-B-tree index, so it becomes a sequential scan over `tickets` once the table
-is large. At the ticket volumes a demo or small support team would generate,
-this is not a practical problem. It becomes one as volume grows into the
-tens/hundreds of thousands of rows.
+**Test suite runs against SQLite, with a dialect-aware fallback in the
+repository.** `TicketRepository.search()` checks the session's bind dialect:
+on Postgres it uses the real `tsvector`/`websearch_to_tsquery`/`ts_rank`
+path described above; on any other dialect (SQLite, in the test suite) it
+falls back to a plain `Ticket.title.ilike(...) | Ticket.description.ilike(...)`
+match. `Ticket.search_vector` is declared as
+`TSVECTOR().with_variant(Text(), "sqlite")` on the model specifically so
+`Base.metadata.create_all()` (which `tests/conftest.py` uses to build the
+schema per test run, rather than running Alembic) succeeds on SQLite at
+all — it becomes an ordinary, unpopulated `TEXT` column there.
 
-**Upgrade path, ranked by effort-to-value for this specific system:**
+This was a deliberate tradeoff, not an oversight: a real Postgres-backed
+test suite would exercise the actual FTS code path end-to-end (stemming,
+`ts_rank` ordering, `websearch_to_tsquery` phrase/exclusion syntax) and was
+tried, but it made the suite depend on a running Postgres instance with a
+separate `testdb` database provisioned via a Docker init script — a real
+cost for local iteration speed and CI setup, for a project at this scale.
+SQLite keeps the suite fully self-contained (`pytest` with nothing else
+running) at the cost of the FTS-specific behavior (ranking, stemming, the
+`websearch_to_tsquery` operators) only being exercised manually, by pointing
+`DATABASE_URL` at a real Postgres instance before running `pytest` (see
+`SETUP.md`) rather than on every default test run. If FTS correctness ever
+becomes critical enough to need CI coverage specifically, the fix is a
+separate Postgres-only test job (e.g. a `pytest -k postgres` marker run
+against a CI Postgres service container), not switching the whole suite
+back to Postgres by default.
 
-1. **Postgres full-text search** (`tsvector` generated column + GIN index,
-   queried via `websearch_to_tsquery`). The best next step: no new service to
-   run, stays inside the same transaction as everything else, adds relevance
-   ranking and stemming ("login" also matching "logging in") that `ILIKE`
-   can't do at all.
-2. **`pg_trgm` + GIN index**. Smaller change than full FTS — keeps
-   substring/typo-tolerant matching semantics closer to today's `ILIKE`
-   behavior while making it index-backed. Reasonable middle ground if full
-   FTS ranking isn't needed yet.
+**Remaining upgrade path, if this ever needs to go further:**
+
+1. ~~**Postgres full-text search**~~ — done, see above.
+2. **`pg_trgm` + GIN index**. Would help specifically with typo-tolerant /
+   partial-substring matching that stemmed FTS doesn't cover (e.g. matching
+   "recieve" against "receive"). Not implemented — no signal yet that
+   typo-tolerance is needed beyond what `websearch_to_tsquery` already gives.
 3. **Dedicated search engine** (OpenSearch/Elasticsearch, or a lighter
    option like Meilisearch/Typesense). The right call once you need faceted
    search across many fields, sub-100ms search at high query volume, or
@@ -234,11 +267,6 @@ tens/hundreds of thousands of rows.
    Postgres (CDC, dual writes, or periodic reindex), which is real ongoing
    cost. For this project's actual scale, adopting one now would be
    over-engineering ahead of an actual need.
-
-None of these were implemented in this pass — they're documented here as the
-deliberate next step rather than done, since changing the schema/migration
-for FTS is a decision worth the team signing off on rather than a silent
-change bundled into a review pass.
 
 ---
 
@@ -267,16 +295,16 @@ per-route.
 
 **Decision: structured JSON logs (structlog) with a request-correlation ID
 propagated through every log line for a given request, plus a dedicated
-`BackgroundTaskLogger` for Celery/APScheduler task lifecycles.**
+`BackgroundTaskLogger` for Celery task lifecycles.**
 
 `CorrelationIdMiddleware` reads (or generates) an `X-Request-ID` per request,
 stores it in a `ContextVar`, and every log line emitted during that request —
 across router, service, and repository layers — picks it up automatically
 via a structlog processor, with no need to thread a request ID through every
-function signature. Background tasks (Celery/APScheduler) use the same
-JSON-structured approach with `task_started`/`task_progress`/`task_completed`/
-`task_failed` events, so a ticket's classification failure and its eventual
-retry are traceable as one narrative in the logs rather than scattered
+function signature. Background tasks (Celery) use the same JSON-structured
+approach with `task_started`/`task_progress`/`task_completed`/`task_failed`
+events, so a ticket's classification failure and its eventual retry are
+traceable as one narrative in the logs rather than scattered
 unstructured print-equivalents.
 
 This was chosen over plain `logging.info(f"...")` calls specifically because

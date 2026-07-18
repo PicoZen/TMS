@@ -87,7 +87,7 @@ def classify_ticket_task(self, ticket_id: int) -> dict:
 
         try:
             raise self.retry(
-                exc=exc,
+                # exc=exc,
                 countdown=_backoff_seconds(self.request.retries),
                 max_retries=settings.llm_max_retries,
             )

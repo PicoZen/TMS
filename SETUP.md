@@ -2,7 +2,7 @@
 
 Pure mechanics: what to install, what to configure, how to run it. For *why*
 things are built the way they are (auth design, LLM provider choice,
-background-job architecture, search tradeoffs), see [`DECISIONS.md`](./DECISIONS.md).
+background-job architecture, search tradeoffs), see [`README.md`](./README.md).
 
 ## Prerequisites
 
@@ -32,7 +32,7 @@ cp .env.example .env
 | `LLM_PROVIDER` | `openai` | `openai` \| `mistral` \| `ollama` |
 | `OPENAI_KEY` / `MISTRAL_KEY` | — | Only required for the provider you select |
 | `OLLAMA_URL` | `http://localhost:11434` | Only used when `LLM_PROVIDER=ollama` |
-| `LLM_MAX_RETRIES` | `3` | Celery task-level retries on LLM failure (up to 4 total attempts) — see [`DECISIONS.md`](./DECISIONS.md#llm-provider-tradeoffs) |
+| `LLM_MAX_RETRIES` | `3` | Celery task-level retries on LLM failure (up to 4 total attempts) — see [`README.md`](./README.md#llm-provider-tradeoffs) |
 | `LLM_RETRY_BACKOFF_BASE` | `1.0` | Seconds; delay per retry is `base * 2^retry_number` |
 | `LLM_RETRY_BACKOFF_MAX` | `600` | Cap on the backoff delay, in seconds |
 | `CORS_ORIGINS` | `["http://localhost:3000", "http://localhost:8000"]` | JSON array |
@@ -121,13 +121,43 @@ alembic downgrade -1
 pytest
 ```
 
-Tests run against SQLite (`test.db`) with the LLM service auto-swapped to
-`MockLLMAdapter` (`PYTEST_CURRENT_TEST` is detected automatically) and Celery
-running in eager/in-memory mode — no live provider, broker, or Postgres
-instance is required to run the suite.
+Tests run against SQLite (a local `test.db` file), not Postgres - no
+Docker, database service, or migrations required to run the suite.
+`tests/conftest.py` builds the schema itself
+(`Base.metadata.create_all()`) fresh before every test and drops it after,
+rather than running Alembic migrations. `Ticket.search_vector` is declared
+with `.with_variant(Text(), "sqlite")` (see `src/common/models.py`) so
+schema creation succeeds on SQLite, and `TicketRepository.search()` falls
+back to a plain `ILIKE` match instead of the real Postgres
+`tsvector`/`websearch_to_tsquery` path when it detects a non-Postgres
+dialect - see [`README.md`](./README.md#ticket-search--filtering) for
+why that's an acceptable tradeoff for tests specifically. The LLM service is
+auto-swapped to `MockLLMAdapter` and Celery runs in eager/in-memory mode - no
+live LLM provider, broker, or Redis instance is required either.
+
+To point tests at a different database instead (e.g. to exercise the real
+Postgres full-text-search path), export `DATABASE_URL` before running
+`pytest`:
+
+```bash
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5433/tms_oc pytest
+```
 
 ## Troubleshooting
 
+- **`InterfaceError: cannot perform operation: another operation is in progress`**:
+  this was caused by `init_db()` calling `Base.metadata.create_all()` on every
+  app startup in addition to Alembic already owning the schema — a restart
+  (especially under `uvicorn --reload`) could interrupt that reflection
+  mid-query and hand a half-finished pooled connection to the next real
+  request. Fixed: `init_db()` now only does a connectivity check
+  (`SELECT 1`); Alembic is the only thing that creates or alters tables.
+  Make sure you've run `alembic upgrade head` at least once (step 5) — the
+  app no longer creates tables for you. If you still see this after
+  upgrading, it means something else is sharing a connection across
+  concurrent coroutines - check for any `asyncio.gather(...)` calls using
+  the same `AsyncSession`, since asyncpg connections can only run one query
+  at a time.
 - **Migrations fail against a fresh Postgres container**: make sure
   `docker compose up postgres` has finished its healthcheck before running
   `alembic upgrade head` — the container reports "started" before Postgres
